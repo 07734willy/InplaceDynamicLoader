@@ -8,6 +8,8 @@
 
 #define FILENAME "tmp4.o"
 
+extern  Elf64_Addr  _GLOBAL_OFFSET_TABLE_;
+
 typedef struct MemBlock {
 	struct MemBlock* next;
 	Elf64_Addr pageoff;
@@ -34,6 +36,7 @@ uint8_t* map_mem(FILE* ElfFile, Elf64_Ehdr elfHdr, Elf64_Shdr* elfSect) {
 
 	pagebase = (uint8_t*) malloc(1);
 	free(pagebase);
+	//pagebase += 0x600000;
 
 	Elf64_Addr pageoff = 0;
 	pagebase = (uint8_t *)(((uint64_t)pagebase + pagesize-1) & ~(pagesize-1));
@@ -102,7 +105,7 @@ uint8_t* map_mem(FILE* ElfFile, Elf64_Ehdr elfHdr, Elf64_Shdr* elfSect) {
 		while (curr) {
 			printf("Pre-Alloc\n");
 			raddr = mmap(pagebase + curr->pageoff, curr->size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			printf("Alloc 1\n");
+			printf("Alloc- %p, size: %u\n", pagebase + curr->pageoff, curr->size);
 			if (raddr != pagebase + curr->pageoff) {
 				repeat = 1;
 				pagebase += curr->pageoff + curr->size;
@@ -128,9 +131,13 @@ uint8_t* map_mem(FILE* ElfFile, Elf64_Ehdr elfHdr, Elf64_Shdr* elfSect) {
 	printf("PAST\n");
 	
 	for (i = 0; i < elfHdr.e_shnum; i++) {
+		if (!elfSect[i].sh_addr) { continue; }
+		if (!elfSect[i].sh_size) { continue; }
 		fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
 		printf("%lu %lu\n", elfSect[i].sh_addr, elfSect[i].sh_size);
+		printf("pagebase: %p, +addr: %p, +poffset: %p\n", pagebase, pagebase+elfSect[i].sh_addr, pagebase+pageoff);
 		fread(pagebase + elfSect[i].sh_addr, 1, elfSect[i].sh_size, ElfFile);
+		printf("Next sect: %u\n", i);
 	}
 
 	printf("Success\n");
@@ -164,7 +171,9 @@ int main(int arc, char** argv) {
 	char* SymNames = NULL;
 	char* DynSymNames = NULL;
 	Elf64_Sym* SectSymbols = NULL;
+	Elf64_Sym* SectDynSymbols = NULL;
 	Elf64_Dyn* SectDynamic = NULL;
+	Elf64_Rela* SectRela = NULL;
 	Elf64_Ehdr elfHdr;
 	Elf64_Shdr* elfSect;
 	Elf64_Shdr sectHdr;
@@ -198,6 +207,11 @@ int main(int arc, char** argv) {
 	Elf64_Addr startAddr;
 
 	uint8_t st_idx;
+	uint8_t dst_idx;
+	uint8_t dyn_idx;
+	uint8_t rela_idx;
+	Elf64_Addr got_addr;
+	uint8_t got_sz;
 
 	for (i = 0; i < elfHdr.e_shnum; i++) {
 		if (strcmp(SectNames + elfSect[i].sh_name, ".text") == 0) {
@@ -219,22 +233,136 @@ int main(int arc, char** argv) {
 			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
 			fread(SymNames, 1, elfSect[i].sh_size, ElfFile);
 		}
+
+		if (elfSect[i].sh_type == SHT_DYNSYM) {
+			printf("Found DYNSYM\n");
+			SectDynSymbols = (Elf64_Sym*) malloc(elfSect[i].sh_size);
+			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
+			fread(SectDynSymbols, 1, elfSect[i].sh_size, ElfFile);
+			dst_idx = i;
+		}
+		if (strcmp(SectNames + elfSect[i].sh_name, ".dynstr") == 0) {
+		//if (elfSect[i].sh_type == SHT_STRTAB) {
+			printf("FOUND DYNSTR\n");
+			DynSymNames = malloc(elfSect[i].sh_size);
+			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
+			fread(DynSymNames, 1, elfSect[i].sh_size, ElfFile);
+		}
+		if (elfSect[i].sh_type == SHT_DYNAMIC) {
+			printf("Found DYNAMIC\n");
+			SectDynamic = (Elf64_Dyn*) malloc(elfSect[i].sh_size);
+			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
+			fread(SectDynamic, 1, elfSect[i].sh_size, ElfFile);
+			dyn_idx = i;
+		}
+		if (strcmp(SectNames + elfSect[i].sh_name, ".rela.plt") == 0) {
+		//if (elfSect[i].sh_type == SHT_RELA) {
+			printf("Found RELA\n");
+			SectRela = (Elf64_Rela*) malloc(elfSect[i].sh_size);
+			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
+			fread(SectRela, 1, elfSect[i].sh_size, ElfFile);
+			rela_idx = i;
+		}
+		if (strcmp(SectNames + elfSect[i].sh_name, ".got.plt") == 0) {
+			printf("Found GOT\n");
+			got_addr = elfSect[i].sh_addr;
+			got_sz = elfSect[i].sh_size;
+		}
+
 			
 		printf("%d %ld %ld %ld  %s\n", i, elfSect[i].sh_offset, elfSect[i].sh_size, elfSect[i].sh_addr, SectNames + elfSect[i].sh_name);
 	}
 			
+	printf("===== Symbol Table =====\n");
 	uint32_t j;
 	for (j = 0; j < elfSect[st_idx].sh_size / sizeof(Elf64_Sym); j++) {
-		if (strcmp(SymNames + SectSymbols[j].st_name, "main") == 0) {
+		//if (strcmp(SymNames + SectSymbols[j].st_name, "main") == 0) {
+		if (strcmp(SymNames + SectSymbols[j].st_name, "_start") == 0) {
 			startAddr = SectSymbols[j].st_value;
-			printf(" ++ main location: %lu\n", SectSymbols[j].st_value);
+			//printf(" ++ main location: %lu\n", SectSymbols[j].st_value);
+			printf(" ++ _start location: %lu\n", SectSymbols[j].st_value);
 		}
 		printf("%s\n", SymNames + SectSymbols[j].st_name);
 	}
+	printf("===== Dynmaic Symbol Table =====\n");
+	for (j = 0; j < elfSect[dst_idx].sh_size / sizeof(Elf64_Sym); j++) {
+		printf("%s\n", DynSymNames + SectDynSymbols[j].st_name);
+	}
 
+	printf("===== Dynamic =====\n");
+
+	for (j = 0; j < elfSect[dyn_idx].sh_size / sizeof(Elf64_Dyn); j++) {
+		if (SectDynamic[j].d_tag == DT_NEEDED) {
+			printf("%s\n", DynSymNames + SectDynamic[j].d_un.d_val);
+		}
+	}
+	
+	printf("===== Rela (Dyn) =====\n");
+	
+	for (j = 0; j < elfSect[rela_idx].sh_size / sizeof(Elf64_Rela); j++) {
+		printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRela[j].r_info)].st_name);
+	}
+
+	printf("===== Memory Mapping =====\n");
 	
 	uint8_t* pagebase = map_mem(ElfFile, elfHdr, elfSect);
+
+	printf("pagebase: %p\n", pagebase);
+
+	printf("===== Fixing GOT =====\n");
+
+	for (j = 3; j < got_sz / sizeof(Elf64_Addr); j++) {
+		printf("One\n");
+		((Elf64_Addr*)(pagebase + got_addr))[j] += (Elf64_Addr)pagebase;
+		printf("GOT entry: %lu\n", ((Elf64_Addr*)(pagebase + got_addr))[j]);
+	}
+
+	printf(" -- \n");
 	
+	Elf64_Addr g_got[3];
+
+	for (j = 0; j < 3; j++) {
+		printf(" - GOT: %lu\n", _GLOBAL_OFFSET_TABLE_);
+	}
+
+	//Elf64_Addr* tmp1 = _GLOBAL_OFFSET_TABLE_;
+	
+	printf(" - Main: %p\n", main);
+	//printf(" - GOT: %p\n", (Elf64_Addr*)_GLOBAL_OFFSET_TABLE_);
+	//printf(" - GOT: %p\n", (Elf64_Addr*)((&_GLOBAL_OFFSET_TABLE_)[1]));
+	//printf(" - GOT: %p\n", _GLOBAL_OFFSET_TABLE_);
+	//printf(" - GOT: %p\n", tmp1);
+	//printf(" - GOT: %p\n", &_GLOBAL_OFFSET_TABLE_);
+	//printf(" - GOT: %p\n", &_GLOBAL_OFFSET_TABLE_);
+	Elf64_Addr* pltgot;
+	for (j = 0; j < ~0; j++) {
+		Elf64_Dyn dyn = ((Elf64_Dyn*)_GLOBAL_OFFSET_TABLE_)[j];
+		if (dyn.d_tag == DT_PLTGOT) {
+			pltgot = (Elf64_Addr*)dyn.d_un.d_ptr;
+			printf("-pltgot: %p\n", pltgot);
+			printf("-val: %lu\n",pltgot[0]);
+			printf("-val: %lu\n",pltgot[1]);
+			printf("-val: %lu\n",pltgot[2]);
+			break;
+		}
+	}
+	((Elf64_Addr*)(pagebase + got_addr))[0] = elfSect[dyn_idx].sh_addr;
+	((Elf64_Addr*)(pagebase + got_addr))[1] = pltgot[1];
+	((Elf64_Addr*)(pagebase + got_addr))[2] = pltgot[2];
+
+	Elf64_Addr tmp2;
+	asm volatile ("movq _GLOBAL_OFFSET_TABLE_(%%rip), %0"
+		: "=r"(tmp2)
+		:
+		:);
+	printf(" ASM: %lu\n", tmp2);
+
+	printf("===== Basic Malloc Test =====\n");
+
+	malloc(1000);
+	
+	
+	printf("===== Begin Execution =====\n");
 	/*
 	uint8_t repeat = 1;
 	while (repeat) {
