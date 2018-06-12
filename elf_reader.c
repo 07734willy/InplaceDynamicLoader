@@ -5,10 +5,11 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <elf.h>
+#include <dlfcn.h>
 
 #define FILENAME "tmp4.o"
 
-extern  Elf64_Addr  _GLOBAL_OFFSET_TABLE_;
+extern  Elf64_Addr  _GLOBAL_OFFSET_TABLE_[];
 
 typedef struct MemBlock {
 	struct MemBlock* next;
@@ -173,7 +174,8 @@ int main(int arc, char** argv) {
 	Elf64_Sym* SectSymbols = NULL;
 	Elf64_Sym* SectDynSymbols = NULL;
 	Elf64_Dyn* SectDynamic = NULL;
-	Elf64_Rela* SectRela = NULL;
+	Elf64_Rela* SectRelaPlt = NULL;
+	Elf64_Rela* SectRelaDyn = NULL;
 	Elf64_Ehdr elfHdr;
 	Elf64_Shdr* elfSect;
 	Elf64_Shdr sectHdr;
@@ -209,8 +211,11 @@ int main(int arc, char** argv) {
 	uint8_t st_idx;
 	uint8_t dst_idx;
 	uint8_t dyn_idx;
-	uint8_t rela_idx;
+	uint8_t rela_plt_idx;
+	uint8_t rela_dyn_idx;
 	Elf64_Addr got_addr;
+	Elf64_Addr rela_plt_addr;
+	Elf64_Addr rela_dyn_addr;
 	uint8_t got_sz;
 
 	for (i = 0; i < elfHdr.e_shnum; i++) {
@@ -257,11 +262,21 @@ int main(int arc, char** argv) {
 		}
 		if (strcmp(SectNames + elfSect[i].sh_name, ".rela.plt") == 0) {
 		//if (elfSect[i].sh_type == SHT_RELA) {
-			printf("Found RELA\n");
-			SectRela = (Elf64_Rela*) malloc(elfSect[i].sh_size);
+			printf("Found RELA (plt)\n");
+			SectRelaPlt = (Elf64_Rela*) malloc(elfSect[i].sh_size);
 			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
-			fread(SectRela, 1, elfSect[i].sh_size, ElfFile);
-			rela_idx = i;
+			fread(SectRelaPlt, 1, elfSect[i].sh_size, ElfFile);
+			rela_plt_addr = elfSect[i].sh_addr;
+			rela_plt_idx = i;
+		}
+		if (strcmp(SectNames + elfSect[i].sh_name, ".rela.dyn") == 0) {
+		//if (elfSect[i].sh_type == SHT_RELA) {
+			printf("Found RELA (dyn)\n");
+			SectRelaDyn = (Elf64_Rela*) malloc(elfSect[i].sh_size);
+			fseek(ElfFile, elfSect[i].sh_offset, SEEK_SET);
+			fread(SectRelaDyn, 1, elfSect[i].sh_size, ElfFile);
+			rela_dyn_addr = elfSect[i].sh_addr;
+			rela_dyn_idx = i;
 		}
 		if (strcmp(SectNames + elfSect[i].sh_name, ".got.plt") == 0) {
 			printf("Found GOT\n");
@@ -297,17 +312,27 @@ int main(int arc, char** argv) {
 		}
 	}
 	
-	printf("===== Rela (Dyn) =====\n");
-	
-	for (j = 0; j < elfSect[rela_idx].sh_size / sizeof(Elf64_Rela); j++) {
-		printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRela[j].r_info)].st_name);
-	}
 
 	printf("===== Memory Mapping =====\n");
 	
 	uint8_t* pagebase = map_mem(ElfFile, elfHdr, elfSect);
 
 	printf("pagebase: %p\n", pagebase);
+	
+	
+	printf("===== Rela (plt) =====\n");
+	
+	for (j = 0; j < elfSect[rela_plt_idx].sh_size / sizeof(Elf64_Rela); j++) {
+		((Elf64_Rela*)(pagebase + rela_plt_addr))[j].r_offset += (Elf64_Addr)pagebase;
+		printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaPlt[j].r_info)].st_name);
+	}
+
+	printf("===== Rela (dyn) =====\n");
+
+	for (j = 0; j < elfSect[rela_dyn_idx].sh_size / sizeof(Elf64_Rela); j++) {
+		((Elf64_Rela*)(pagebase + rela_dyn_addr))[j].r_offset += (Elf64_Addr)pagebase;
+	printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[j].r_info)].st_name);
+	}
 
 	printf("===== Fixing GOT =====\n");
 
@@ -322,7 +347,33 @@ int main(int arc, char** argv) {
 	Elf64_Addr g_got[3];
 
 	for (j = 0; j < 3; j++) {
-		printf(" - GOT: %lu\n", _GLOBAL_OFFSET_TABLE_);
+		printf(" - GOT: %p\n", _GLOBAL_OFFSET_TABLE_);
+	}
+
+	printf("===== Patching Symbols =====\n");
+	
+	uint32_t k;
+	for (j = 0; j < elfSect[dyn_idx].sh_size / sizeof(Elf64_Dyn); j++) {
+		if (SectDynamic[j].d_tag == DT_NEEDED) {
+			//printf("%s\n", DynSymNames + SectDynamic[j].d_un.d_val);
+			void* handle = dlopen(DynSymNames + SectDynamic[j].d_un.d_val, RTLD_LAZY);
+			for (k = 0; k < elfSect[rela_plt_idx].sh_size / sizeof(Elf64_Rela); k++) {
+				dlerror();
+				void* faddr = dlsym(handle, DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaPlt[k].r_info)].st_name);
+				if (dlerror() == NULL) {
+					*((void**)(pagebase + SectRelaPlt[k].r_offset)) = faddr;
+					printf("Symbol patched: %s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaPlt[k].r_info)].st_name);
+				}
+			}
+			for (k = 0; k < elfSect[rela_dyn_idx].sh_size / sizeof(Elf64_Rela); k++) {
+				dlerror();
+				void* faddr = dlsym(handle, DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[k].r_info)].st_name);
+				if (dlerror() == NULL) {
+					*((void**)(pagebase + SectRelaDyn[k].r_offset)) = faddr;
+					printf("Symbol patched: %s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[k].r_info)].st_name);
+				}
+			}
+		}
 	}
 
 	//Elf64_Addr* tmp1 = _GLOBAL_OFFSET_TABLE_;
@@ -334,7 +385,7 @@ int main(int arc, char** argv) {
 	//printf(" - GOT: %p\n", tmp1);
 	//printf(" - GOT: %p\n", &_GLOBAL_OFFSET_TABLE_);
 	//printf(" - GOT: %p\n", &_GLOBAL_OFFSET_TABLE_);
-	Elf64_Addr* pltgot;
+	/*Elf64_Addr* pltgot;
 	for (j = 0; j < ~0; j++) {
 		Elf64_Dyn dyn = ((Elf64_Dyn*)_GLOBAL_OFFSET_TABLE_)[j];
 		if (dyn.d_tag == DT_PLTGOT) {
@@ -349,17 +400,31 @@ int main(int arc, char** argv) {
 	((Elf64_Addr*)(pagebase + got_addr))[0] = elfSect[dyn_idx].sh_addr;
 	((Elf64_Addr*)(pagebase + got_addr))[1] = pltgot[1];
 	((Elf64_Addr*)(pagebase + got_addr))[2] = pltgot[2];
-
-	Elf64_Addr tmp2;
-	asm volatile ("movq _GLOBAL_OFFSET_TABLE_(%%rip), %0"
-		: "=r"(tmp2)
+	*/
+	Elf64_Addr* pltgot = 0;;
+	asm volatile ("leaq _GLOBAL_OFFSET_TABLE_(%%rip), %0"
+		: "=r"(pltgot)
 		:
 		:);
-	printf(" ASM: %lu\n", tmp2);
+	printf(" ASM: %lu\n", pltgot[0]);
+	printf(" ASM: %lu\n", pltgot[1]);
+	printf(" ASM: %lu\n", pltgot[2]);
+	//((Elf64_Addr*)(pagebase + got_addr))[0] = elfSect[dyn_idx].sh_addr;
+	//((Elf64_Addr*)(pagebase + got_addr))[1] = elfSect[rela_idx].sh_addr;
+	((Elf64_Dyn**)(pagebase + got_addr))[0] = (Elf64_Dyn*)(pagebase + elfSect[dyn_idx].sh_addr);
+	//((Elf64_Rela**)(pagebase + got_addr))[1] = (Elf64_Rela*)(pagebase + elfSect[rela_dyn_idx].sh_addr);
+	((Elf64_Addr*)(pagebase + got_addr))[1] = 0;
+	//((Elf64_Addr*)(pagebase + got_addr))[1] = pltgot[1];
+	((Elf64_Addr*)(pagebase + got_addr))[2] = pltgot[2];
+
+	printf(" _dynamic: %lu\n", (Elf64_Addr)elfSect[dyn_idx].sh_addr);
+	printf(" reloc: %lu\n", (Elf64_Addr)elfSect[rela_dyn_idx].sh_addr);
 
 	printf("===== Basic Malloc Test =====\n");
 
 	malloc(1000);
+
+	//int tmpval = *((int*)(0x2006c9 + 0x727 + pagebase));
 	
 	
 	printf("===== Begin Execution =====\n");
