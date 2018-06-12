@@ -7,7 +7,7 @@
 #include <elf.h>
 #include <dlfcn.h>
 
-#define FILENAME "tmp4.o"
+#define FILENAME "tmp6.o"
 
 extern  Elf64_Addr  _GLOBAL_OFFSET_TABLE_[];
 
@@ -288,36 +288,27 @@ int main(int arc, char** argv) {
 		printf("%d %ld %ld %ld  %s\n", i, elfSect[i].sh_offset, elfSect[i].sh_size, elfSect[i].sh_addr, SectNames + elfSect[i].sh_name);
 	}
 			
-	printf("===== Symbol Table =====\n");
-	uint32_t j;
-	for (j = 0; j < elfSect[st_idx].sh_size / sizeof(Elf64_Sym); j++) {
-		//if (strcmp(SymNames + SectSymbols[j].st_name, "main") == 0) {
-		if (strcmp(SymNames + SectSymbols[j].st_name, "_start") == 0) {
-			startAddr = SectSymbols[j].st_value;
-			//printf(" ++ main location: %lu\n", SectSymbols[j].st_value);
-			printf(" ++ _start location: %lu\n", SectSymbols[j].st_value);
-		}
-		printf("%s\n", SymNames + SectSymbols[j].st_name);
-	}
-	printf("===== Dynmaic Symbol Table =====\n");
-	for (j = 0; j < elfSect[dst_idx].sh_size / sizeof(Elf64_Sym); j++) {
-		printf("%s\n", DynSymNames + SectDynSymbols[j].st_name);
-	}
 
-	printf("===== Dynamic =====\n");
-
-	for (j = 0; j < elfSect[dyn_idx].sh_size / sizeof(Elf64_Dyn); j++) {
-		if (SectDynamic[j].d_tag == DT_NEEDED) {
-			printf("%s\n", DynSymNames + SectDynamic[j].d_un.d_val);
-		}
-	}
 	
+	uint32_t j;
 
 	printf("===== Memory Mapping =====\n");
 	
 	uint8_t* pagebase = map_mem(ElfFile, elfHdr, elfSect);
 
 	printf("pagebase: %p\n", pagebase);
+	
+	printf("===== Dynamic =====\n");
+
+	for (j = 0; j < elfSect[dyn_idx].sh_size / sizeof(Elf64_Dyn); j++) {
+		if (SectDynamic[j].d_tag == DT_NEEDED) {
+			printf("%s\n", DynSymNames + SectDynamic[j].d_un.d_val);
+		}
+		Elf64_Sxword tag = SectDynamic[j].d_tag;
+		if (tag == DT_PLTGOT || tag == DT_HASH || tag == DT_STRTAB || tag == DT_SYMTAB || tag == DT_RELA || tag == DT_INIT || tag == DT_FINI || tag == DT_REL || tag == DT_DEBUG || tag == DT_JMPREL) {
+			((Elf64_Dyn*)(pagebase + elfSect[dyn_idx].sh_addr))[j].d_un.d_ptr += (Elf64_Addr)pagebase;
+		}
+	}
 	
 	
 	printf("===== Rela (plt) =====\n");
@@ -350,7 +341,7 @@ int main(int arc, char** argv) {
 		printf(" - GOT: %p\n", _GLOBAL_OFFSET_TABLE_);
 	}
 
-	printf("===== Patching Symbols =====\n");
+	printf("===== Patching GOT LIBS =====\n");
 	
 	uint32_t k;
 	for (j = 0; j < elfSect[dyn_idx].sh_size / sizeof(Elf64_Dyn); j++) {
@@ -373,6 +364,46 @@ int main(int arc, char** argv) {
 					printf("Symbol patched: %s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[k].r_info)].st_name);
 				}
 			}
+		}
+	}
+	printf("===== Symbol Table =====\n");
+	for (j = 0; j < elfSect[st_idx].sh_size / sizeof(Elf64_Sym); j++) {
+		//if (strcmp(SymNames + SectSymbols[j].st_name, "main") == 0) {
+		if (strcmp(SymNames + SectSymbols[j].st_name, "_start") == 0) {
+			startAddr = SectSymbols[j].st_value;
+			//printf(" ++ main location: %lu\n", SectSymbols[j].st_value);
+			printf(" ++ _start location: %lu\n", SectSymbols[j].st_value);
+		}
+		if (SectSymbols[j].st_value != 0) {
+			if (strcmp(SymNames + SectSymbols[j].st_name, "_start") == 0) {
+				continue;
+			}
+			if (strcmp(SymNames + SectSymbols[j].st_name, "dummy_frame") == 0) {
+				//((Elf64_Sym*)(pagebase + elfSect[st_idx].sh_addr))[j].st_value += (Elf64_Addr)pagebase;
+			}
+			//((Elf64_Sym*)(pagebase + elfSect[st_idx].sh_addr))[j].st_value += (Elf64_Addr)pagebase;
+		}
+		printf("%s\n", SymNames + SectSymbols[j].st_name);
+	}
+	printf("===== Dynamic Symbol Table =====\n");
+	for (j = 0; j < elfSect[dst_idx].sh_size / sizeof(Elf64_Sym); j++) {
+		if (SectDynSymbols[j].st_value != 0) {
+			//((Elf64_Sym*)(pagebase + elfSect[dst_idx].sh_addr))[j].st_value += (Elf64_Addr)pagebase;
+		}
+		printf("%s\n", DynSymNames + SectDynSymbols[j].st_name);
+	}
+
+	printf("===== Patching Init/Fini Array =====\n");
+
+	for (i = 0; i < elfHdr.e_shnum; i++) {
+		if (strcmp(SectNames + elfSect[i].sh_name, ".init_array") == 0) {
+			*((Elf64_Addr*)(pagebase + elfSect[i].sh_addr)) += (Elf64_Addr)pagebase;
+			printf("patched init_array\n");
+		}
+		if (strcmp(SectNames + elfSect[i].sh_name, ".fini_array") == 0) {
+			*((Elf64_Addr*)(pagebase + elfSect[i].sh_addr)) += (Elf64_Addr)pagebase;
+			//*((Elf64_Addr*)(pagebase + elfSect[i].sh_addr)) = (Elf64_Addr)map_mem;
+			printf("patched fini_array\n");
 		}
 	}
 
