@@ -3,37 +3,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <stdlib.h>
 #include <elf.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "elf_reader.h"
 
-#define FILENAME "tmp4.o"
-#define FORCE_BASE 1
-#define FORCE_NONE 0
-
-typedef uint8_t Elf64_Byte;
-
-typedef struct MMap {
-	Elf64_Addr	m_offset;
-	Elf64_Word	m_size;
-	Elf64_Byte 	m_mapped;
-	struct MMap* m_next;
-} MMap;
-
-typedef struct MemBlock {
-	Elf64_Addr	pageoff;
-	Elf64_Word	size;
-	uint8_t 	mapped;
-	struct MemBlock* next;
-} MemBlock;
-
-typedef struct {
-	Elf64_Byte* d_data;
-	Elf64_Byte*	d_base;
-	MMap*		d_mmap;
-} Elf64_Data;
 
 int sectCmp(const void* a, const void* b) {
 	return ((Elf64_Shdr*)a)->sh_addr - ((Elf64_Shdr*)b)->sh_addr;
@@ -113,9 +88,13 @@ Elf64_Data mapMem(Elf64_Data elf, Elf64_Byte* elfbase, Elf64_Byte force_base) {
 	
 	MMap* curr;
 	curr = elf.d_mmap;
-	while (curr) {
-		printf("%lu %u\n", curr->m_offset, curr->m_size);
-		curr = curr->m_next;
+
+	if (!force_base) {
+		Elf64_Byte* ptr = malloc(1);
+		if (ptr > elfbase) {
+			elfbase = ptr + pagesize;
+		}
+		free(ptr);
 	}
 	Elf64_Byte repeat = 1;
 	while (repeat) {
@@ -137,9 +116,11 @@ Elf64_Data mapMem(Elf64_Data elf, Elf64_Byte* elfbase, Elf64_Byte force_base) {
 				}
 				repeat = 1;
 				elfbase += curr->m_offset + curr->m_size;
-				if (elfbase < maddr) { elfbase = maddr; }
+				//if (elfbase < maddr) { elfbase = maddr; }
 				elfbase = (Elf64_Byte *)(((Elf64_Xword)elfbase + pagesize-1) & ~(pagesize-1));
+				#ifdef DEBUG_2
 				printf("Failed mmap\n");
+				#endif
 				break;
 			}
 			curr->m_mapped = 1;
@@ -156,14 +137,12 @@ Elf64_Data mapMem(Elf64_Data elf, Elf64_Byte* elfbase, Elf64_Byte force_base) {
 	}
 	elf.d_base = elfbase;
 
-	printf("PAST\n");
 	
 	uint32_t i;
 	for (i = 0; i < elfHdr.e_shnum; i++) {
 		if (!elfSect[i].sh_addr || !elfSect[i].sh_size) { continue; }
 		memcpy(elfbase + elfSect[i].sh_addr, elf.d_data + elfSect[i].sh_offset, elfSect[i].sh_size);
 	}
-	printf("MMap Success\n");
 
 	return elf;
 }
@@ -174,14 +153,18 @@ void patchStatic(Elf64_Data elf) {
 	Elf64_Shdr sectHdr;
 	uint32_t j;
 
+	#ifdef DEBUG_1
 	printf("===== Dynamic =====\n");
+	#endif
 	
 	sectHdr = *getSect(elf, ".dynamic");
 	Elf64_Dyn* SectDynamic = (Elf64_Dyn*)(elf.d_data + sectHdr.sh_offset);
 	Elf64_Byte* DynSymNames = (Elf64_Byte*)(elf.d_data + getSect(elf, ".dynstr")->sh_offset);
 	for (j = 0; j < sectHdr.sh_size / sizeof(Elf64_Dyn); j++) {
 		if (SectDynamic[j].d_tag == DT_NEEDED) {
+			#ifdef DEBUG_2
 			printf("%s\n", DynSymNames + SectDynamic[j].d_un.d_val);
+			#endif
 		}
 		Elf64_Sxword tag = SectDynamic[j].d_tag;
 		if (tag == DT_PLTGOT || tag == DT_HASH || tag == DT_STRTAB || tag == DT_SYMTAB || tag == DT_RELA || tag == DT_INIT || tag == DT_FINI || tag == DT_REL || tag == DT_DEBUG || tag == DT_JMPREL) {
@@ -189,46 +172,64 @@ void patchStatic(Elf64_Data elf) {
 		}
 	}
 	
+	#ifdef DEBUG_1
 	printf("===== Rela (plt) =====\n");
+	#endif
 	
 	sectHdr = *getSect(elf, ".rela.plt");
 	Elf64_Rela* SectRelaPlt = (Elf64_Rela*)(elf.d_data + sectHdr.sh_offset);
 	Elf64_Sym* SectDynSymbols = (Elf64_Sym*)(elf.d_data + getSect(elf, ".dynsym")->sh_offset);
 	for (j = 0; j < sectHdr.sh_size / sizeof(Elf64_Rela); j++) {
 		((Elf64_Rela*)(elf.d_base + sectHdr.sh_addr))[j].r_offset += (Elf64_Addr)elf.d_base;
+		#ifdef DEBUG_2
 		printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaPlt[j].r_info)].st_name);
+		#endif
 	}
 
+	#ifdef DEBUG_1
 	printf("===== Rela (dyn) =====\n");
+	#endif
 
 	sectHdr = *getSect(elf, ".rela.dyn");
 	Elf64_Rela* SectRelaDyn = (Elf64_Rela*)(elf.d_data + sectHdr.sh_offset);
 	for (j = 0; j < sectHdr.sh_size / sizeof(Elf64_Rela); j++) {
 		((Elf64_Rela*)(elf.d_base + sectHdr.sh_addr))[j].r_offset += (Elf64_Addr)elf.d_base;
-	printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[j].r_info)].st_name);
+		#ifdef DEBUG_2
+		printf("%s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[j].r_info)].st_name);
+		#endif
 	}
 
+	#ifdef DEBUG_1
 	printf("===== Fixing GOT =====\n");
+	#endif
 
 	sectHdr = *getSect(elf, ".got.plt");
 	for (j = 3; j < sectHdr.sh_size / sizeof(Elf64_Addr); j++) {
 		((Elf64_Addr*)(elf.d_base + sectHdr.sh_addr))[j] += (Elf64_Addr)elf.d_base;
+		#ifdef DEBUG_2
 		printf("GOT entry: %lu\n", ((Elf64_Addr*)(elf.d_base + sectHdr.sh_addr))[j]);
+		#endif
 	}
 	
+	#ifdef DEBUG_1
 	printf("===== Patching Init/Fini Array =====\n");
+	#endif
 	
 	
 	sectHdr = *getSect(elf, ".init_array");
 	for (j = 0; j < sectHdr.sh_size / sizeof(Elf64_Addr); j++) {
 		*((Elf64_Addr*)(elf.d_base + sectHdr.sh_addr)) += (Elf64_Addr)elf.d_base;
+		#ifdef DEBUG_1
 		printf("patched init_array\n");
+		#endif
 	}
 
 	sectHdr = *getSect(elf, ".fini_array");
 	for (j = 0; j < sectHdr.sh_size / sizeof(Elf64_Addr); j++) {
 		*((Elf64_Addr*)(elf.d_base + sectHdr.sh_addr)) += (Elf64_Addr)elf.d_base;
+		#ifdef DEBUG_1
 		printf("patched fini_array\n");
+		#endif
 	}
 }
 
@@ -252,7 +253,9 @@ void patchDynLibs(Elf64_Data elf) {
 				void* faddr = dlsym(handle, DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaPlt[j].r_info)].st_name);
 				if (dlerror() == NULL) {
 					*((void**)(elf.d_base + SectRelaPlt[j].r_offset)) = faddr;
+					#ifdef DEBUG_2
 					printf("Symbol patched: %s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaPlt[j].r_info)].st_name);
+					#endif
 				}
 			}
 			for (j = 0; j < relaDynHdr.sh_size / sizeof(Elf64_Rela); j++) {
@@ -260,14 +263,16 @@ void patchDynLibs(Elf64_Data elf) {
 				void* faddr = dlsym(handle, DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[j].r_info)].st_name);
 				if (dlerror() == NULL) {
 					*((void**)(elf.d_base + SectRelaDyn[j].r_offset)) = faddr;
+					#ifdef DEBUG_2
 					printf("Symbol patched: %s\n", DynSymNames + SectDynSymbols[ELF64_R_SYM(SectRelaDyn[j].r_info)].st_name);
+					#endif
 				}
 			}
 		}
 	}
 }
 
-uint32_t execElf(Elf64_Data elf, const char* entry) {
+int32_t execElf(Elf64_Data elf, const char* entry) {
 	Elf64_Ehdr elfHdr = *(Elf64_Ehdr*)elf.d_data;
 	
 	Elf64_Byte* fptr = elf.d_base;
@@ -276,16 +281,13 @@ uint32_t execElf(Elf64_Data elf, const char* entry) {
 	} else {
 		fptr += elfHdr.e_entry;
 	}
-	return ((uint32_t (*)())fptr)();
+	return ((int32_t (*)())fptr)();
 }
 
-#define FILESELF "elf_reader"
-
-void clean_exit() {
-	printf("Patching In Original Program\n");
+Elf64_Data readFile(const char* name) {
 	FILE* ElfFile;
-	if ((ElfFile = fopen(FILESELF, "r")) == NULL) {
-		printf("Couldn't open file: %s\n", FILESELF);
+	if ((ElfFile = fopen(name, "r")) == NULL) {
+		printf("Couldn't open file: %s\n", name);
 		exit(1);
 	}
 	
@@ -301,107 +303,129 @@ void clean_exit() {
 	elf.d_data = buffer;
 	elf.d_base = 0;
 	elf.d_mmap = NULL;
+	
+	return elf;
+}
+	
 
-	printf("Calculating Memory Segments\n");
+Elf64_Xword getVirtSize(Elf64_Data elf) {	
+	Elf64_Ehdr elfHdr = *(Elf64_Ehdr*)elf.d_data;
+	Elf64_Shdr* elfSect = (Elf64_Shdr*)(elf.d_data + elfHdr.e_shoff);
+
+	uint32_t i;
+	Elf64_Xword size = 0;
+	for (i = 0; i < elfHdr.e_shnum; i++) {
+		Elf64_Xword sectSize = elfSect[i].sh_addr + elfSect[i].sh_size;
+		if (sectSize > size) {
+			size = sectSize;
+		}
+	}
+	return size;
+}
+
+void unmapElf(Elf64_Data elf) {
+	MMap* curr = elf.d_mmap;
+	while (curr) {
+		munmap(elf.d_base + curr->m_offset, curr->m_size);
+		curr = curr->m_next;
+	}
+}
+
+void closeLibs(Elf64_Data elf) {
+	Elf64_Shdr dynamicHdr = *getSect(elf, ".dynamic");
+	Elf64_Dyn* SectDynamic = (Elf64_Dyn*)(elf.d_data + dynamicHdr.sh_offset);
+	Elf64_Byte* DynSymNames = (Elf64_Byte*)(elf.d_data + getSect(elf, ".dynstr")->sh_offset);
+
+	uint32_t i;
+	for (i = 0; i < dynamicHdr.sh_size / sizeof(Elf64_Dyn); i++) {
+		if (SectDynamic[i].d_tag == DT_NEEDED) {
+			dlclose(DynSymNames + SectDynamic[i].d_un.d_val);
+		}
+	}
+}
+
+void freeElf(Elf64_Data elf) {
+	free(elf.d_data);
+	
+	MMap* next;
+	MMap* curr = elf.d_mmap;
+	while (curr) {
+		next = curr->m_next;
+		free(curr);
+		curr = next;
+	}
+}
+
+void cleanExit() {
+	printf("[IDL] Patching In Original Host\n");
+	Elf64_Data elf = readFile(FILESELF);
+
 	elf = elfMakeMap(elf);
-	printf("Making Memory Maps\n");
 	elf = mapMem(elf, NULL, FORCE_BASE);
-	printf("Patching Static Values\n");
 	patchStatic(elf);
-	printf("Patching Dynamic Libraries\n");
 	patchDynLibs(elf);
-	printf("Returning Down Call-Stack\n");
+	freeElf(elf);
+	printf("[IDL] Returning Down Call-Stack\n");
 	return;
 }
 
-void hoisted_main() {
-	printf("Inside of Hoisted Main\n");
+int32_t hoisted_host() {
 
-	FILE* ElfFile;
-	if ((ElfFile = fopen(FILENAME, "r")) == NULL) {
-		printf("Couldn't open file: %s\n", FILENAME);
-		exit(1);
-	}
-	
-	fseek(ElfFile, 0L, SEEK_END);
-	ssize_t filelen = ftell(ElfFile);
-	fseek(ElfFile, 0L, SEEK_SET);
-
-	Elf64_Byte* buffer = (Elf64_Byte*) malloc(filelen);
-	fread(buffer, 1, filelen, ElfFile);
-	fclose(ElfFile);
-
-	Elf64_Data elf;
-	elf.d_data = buffer;
-	elf.d_base = 0;
-	elf.d_mmap = NULL;
-	
-	
+	Elf64_Data elf = readFile(FILENAME);	
 	Elf64_Word pagesize = getpagesize();
 	
-	printf("Calculating Memory Segments\n");
+	printf("[IDL] Making Memory Maps\n");
 	elf = elfMakeMap(elf);
-	printf("Making Memory Maps\n");
 	elf = mapMem(elf, NULL, FORCE_BASE);
-	printf("Patching Static Values\n");
+	printf("[IDL] Patching Binary\n");
 	patchStatic(elf);
-	printf("Patching Dynamic Libraries\n");
 	patchDynLibs(elf);
-	printf("Executing Program\n");
-	execElf(elf, "main");
-	printf("Terminating Process\n");
-
-	printf("Leaving Hoisted Main\n");
+	printf("[IDL] Executing Program\n");
+	int32_t retval = execElf(elf, "main");
+	printf("[IDL] Program Exit Code: %d\n", retval);
+	closeLibs(elf);
+	unmapElf(elf);
+	freeElf(elf);
+	cleanExit();
 	
-	clean_exit();
-	return;
+	return retval;
 }
 
-
-int main(int arc, char** argv) {
-	FILE* ElfFile;
-	if ((ElfFile = fopen(FILESELF, "r")) == NULL) {
-		printf("Couldn't open file: %s\n", FILESELF);
-		exit(1);
-	}
-	/*if ((ElfFile = fopen(FILENAME, "r")) == NULL) {
-		printf("Couldn't open file: %s\n", FILENAME);
-		exit(1);
-	}*/
-	
-	fseek(ElfFile, 0L, SEEK_END);
-	ssize_t filelen = ftell(ElfFile);
-	fseek(ElfFile, 0L, SEEK_SET);
-
-	Elf64_Byte* buffer = (Elf64_Byte*) malloc(filelen);
-	fread(buffer, 1, filelen, ElfFile);
-	fclose(ElfFile);
-
-	// TODO - make sure to shift hoisted_main far enough (check virt size of -other)
-
+int32_t host() {
 	Elf64_Data elf;
-	elf.d_data = buffer;
-	elf.d_base = 0;
-	elf.d_mmap = NULL;
-
-	//printf("munmap: %d\n", munmap(NULL, 0x220000));
-
-	Elf64_Addr orig_base = ((Elf64_Addr)main) - getSym(elf, "main")->st_value;
-	printf("orig: %lu\n", orig_base);
-	printf("orig_base: %p %lu\n", main, getSym(elf, "main")->st_value);
+	int32_t retval;
+	if (is_PIC) {
+		elf = readFile(FILENAME);
+		printf("[IDL] Making Memory Maps\n");
+		elf = elfMakeMap(elf);
+		elf = mapMem(elf, NULL, FORCE_NONE);
+		printf("[IDL] Patching Binary\n");
+		patchStatic(elf);
+		patchDynLibs(elf);
+		printf("[IDL] Executing Program\n");
+		retval = execElf(elf, "main");
+		printf("[IDL] Program Exit Code: %d\n", retval);
+		printf("[IDL] Terminating Process\n");
+		unmapElf(elf);
+		freeElf(elf);
+	} else {
+		elf = readFile(FILESELF);
+		printf("[IDL] Self-Hoisting Host\n");
+		elf = elfMakeMap(elf);
+		Elf64_Byte* base = (Elf64_Byte*) NULL + getVirtSize(readFile(FILENAME)) + getpagesize() * 2;
+		elf = mapMem(elf, base, FORCE_NONE);
+		patchStatic(elf);
+		patchDynLibs(elf);
+		printf("[IDL] Executing Hoisted Host\n");
+		retval = execElf(elf, "hoisted_host");
+		printf("[IDL] Terminating Process\n");
+		unmapElf(elf);
+		freeElf(elf);
+	}
 	
-	printf("Calculating Memory Segments\n");
-	elf = elfMakeMap(elf);
-	printf("Making Memory Maps\n");
-	elf = mapMem(elf, NULL, FORCE_NONE);
-	printf("Patching Static Values\n");
-	patchStatic(elf);
-	printf("Patching Dynamic Libraries\n");
-	patchDynLibs(elf);
-	printf("===== Executing Program =====\n");
-	execElf(elf, "hoisted_main");
-	//execElf(elf, "main");
-	printf("===== Terminating Process =====\n");
-	
-	return 0;
+	return retval;
+}
+
+int main(int argc, char** argv) {
+	return host();
 }
