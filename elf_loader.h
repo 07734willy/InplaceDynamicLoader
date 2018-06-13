@@ -1,8 +1,8 @@
-#ifndef ELF_READER_H
-#define ELF_READER_H
+#ifndef ELF_LOADER_H
+#define ELF_LOADER_H
 
-#define FILENAME "tmp4.o"
-#define FILESELF "elf_reader"
+#define FILENAME "example"
+#define FILESELF "elf_loader"
 #define FORCE_BASE 1
 #define FORCE_NONE 0
 

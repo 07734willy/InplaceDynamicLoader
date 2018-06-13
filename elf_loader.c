@@ -7,7 +7,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "elf_reader.h"
+#include "elf_loader.h"
 
 
 int sectCmp(const void* a, const void* b) {
