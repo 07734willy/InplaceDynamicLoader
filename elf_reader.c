@@ -9,7 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define FILENAME "tmp6.o"
+#define FILENAME "tmp4.o"
 #define FORCE_BASE 1
 #define FORCE_NONE 0
 
@@ -82,7 +82,7 @@ Elf64_Data elfMakeMap(Elf64_Data elf) {
 	for (i = 0; i < elfHdr.e_shnum; i++) {
 		if (!elfSect[i].sh_addr || !elfSect[i].sh_size) { continue; }
 
-		if (pageoff + msize + pagesize < elfSect[i].sh_addr & ~(pagesize-1)) {
+		if ((pageoff + msize + pagesize) < (elfSect[i].sh_addr & ~(pagesize-1))) {
 			MMap* map = (MMap*) malloc(sizeof(MMap));
 			map->m_offset = pageoff;
 			map->m_size = msize;
@@ -124,6 +124,17 @@ Elf64_Data mapMem(Elf64_Data elf, Elf64_Byte* elfbase, Elf64_Byte force_base) {
 		while (curr) {
 			maddr = mmap(elfbase + curr->m_offset, curr->m_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | flag, -1, 0);
 			if (maddr != elfbase + curr->m_offset) {
+				if (maddr == MAP_FAILED && flag == MAP_FIXED) {
+					printf("Could not map program to base address: %p, of size: %u\n", elfbase, curr->m_size);
+					exit(1);
+					/*printf("memprot %d\n", mprotect(elfbase + curr->m_offset, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC));
+					curr->m_offset += pagesize;
+					curr->m_size -= pagesize;
+					if (curr->m_size <= 0) {
+						curr = curr->m_next;
+					}
+					continue;*/
+				}
 				repeat = 1;
 				elfbase += curr->m_offset + curr->m_size;
 				if (elfbase < maddr) { elfbase = maddr; }
@@ -145,15 +156,14 @@ Elf64_Data mapMem(Elf64_Data elf, Elf64_Byte* elfbase, Elf64_Byte force_base) {
 	}
 	elf.d_base = elfbase;
 
-	//printf("PAST\n");
+	printf("PAST\n");
 	
 	uint32_t i;
 	for (i = 0; i < elfHdr.e_shnum; i++) {
 		if (!elfSect[i].sh_addr || !elfSect[i].sh_size) { continue; }
 		memcpy(elfbase + elfSect[i].sh_addr, elf.d_data + elfSect[i].sh_offset, elfSect[i].sh_size);
 	}
-
-	//printf("Success\n");
+	printf("MMap Success\n");
 
 	return elf;
 }
@@ -269,18 +279,116 @@ uint32_t execElf(Elf64_Data elf, const char* entry) {
 	return ((uint32_t (*)())fptr)();
 }
 
-void test() {
-}
+#define FILESELF "elf_reader"
 
-int main(int arc, char** argv) {
-	Elf64_Byte buffer[20000];
-	int fd = open(FILENAME, O_RDONLY);
-	ssize_t size = read(fd, buffer, 20000);
+void clean_exit() {
+	printf("Patching In Original Program\n");
+	FILE* ElfFile;
+	if ((ElfFile = fopen(FILESELF, "r")) == NULL) {
+		printf("Couldn't open file: %s\n", FILESELF);
+		exit(1);
+	}
+	
+	fseek(ElfFile, 0L, SEEK_END);
+	ssize_t filelen = ftell(ElfFile);
+	fseek(ElfFile, 0L, SEEK_SET);
+
+	Elf64_Byte* buffer = (Elf64_Byte*) malloc(filelen);
+	fread(buffer, 1, filelen, ElfFile);
+	fclose(ElfFile);
 
 	Elf64_Data elf;
 	elf.d_data = buffer;
 	elf.d_base = 0;
 	elf.d_mmap = NULL;
+
+	printf("Calculating Memory Segments\n");
+	elf = elfMakeMap(elf);
+	printf("Making Memory Maps\n");
+	elf = mapMem(elf, NULL, FORCE_BASE);
+	printf("Patching Static Values\n");
+	patchStatic(elf);
+	printf("Patching Dynamic Libraries\n");
+	patchDynLibs(elf);
+	printf("Returning Down Call-Stack\n");
+	return;
+}
+
+void hoisted_main() {
+	printf("Inside of Hoisted Main\n");
+
+	FILE* ElfFile;
+	if ((ElfFile = fopen(FILENAME, "r")) == NULL) {
+		printf("Couldn't open file: %s\n", FILENAME);
+		exit(1);
+	}
+	
+	fseek(ElfFile, 0L, SEEK_END);
+	ssize_t filelen = ftell(ElfFile);
+	fseek(ElfFile, 0L, SEEK_SET);
+
+	Elf64_Byte* buffer = (Elf64_Byte*) malloc(filelen);
+	fread(buffer, 1, filelen, ElfFile);
+	fclose(ElfFile);
+
+	Elf64_Data elf;
+	elf.d_data = buffer;
+	elf.d_base = 0;
+	elf.d_mmap = NULL;
+	
+	
+	Elf64_Word pagesize = getpagesize();
+	
+	printf("Calculating Memory Segments\n");
+	elf = elfMakeMap(elf);
+	printf("Making Memory Maps\n");
+	elf = mapMem(elf, NULL, FORCE_BASE);
+	printf("Patching Static Values\n");
+	patchStatic(elf);
+	printf("Patching Dynamic Libraries\n");
+	patchDynLibs(elf);
+	printf("Executing Program\n");
+	execElf(elf, "main");
+	printf("Terminating Process\n");
+
+	printf("Leaving Hoisted Main\n");
+	
+	clean_exit();
+	return;
+}
+
+
+int main(int arc, char** argv) {
+	FILE* ElfFile;
+	if ((ElfFile = fopen(FILESELF, "r")) == NULL) {
+		printf("Couldn't open file: %s\n", FILESELF);
+		exit(1);
+	}
+	/*if ((ElfFile = fopen(FILENAME, "r")) == NULL) {
+		printf("Couldn't open file: %s\n", FILENAME);
+		exit(1);
+	}*/
+	
+	fseek(ElfFile, 0L, SEEK_END);
+	ssize_t filelen = ftell(ElfFile);
+	fseek(ElfFile, 0L, SEEK_SET);
+
+	Elf64_Byte* buffer = (Elf64_Byte*) malloc(filelen);
+	fread(buffer, 1, filelen, ElfFile);
+	fclose(ElfFile);
+
+	// TODO - make sure to shift hoisted_main far enough (check virt size of -other)
+
+	Elf64_Data elf;
+	elf.d_data = buffer;
+	elf.d_base = 0;
+	elf.d_mmap = NULL;
+
+	//printf("munmap: %d\n", munmap(NULL, 0x220000));
+
+	Elf64_Addr orig_base = ((Elf64_Addr)main) - getSym(elf, "main")->st_value;
+	printf("orig: %lu\n", orig_base);
+	printf("orig_base: %p %lu\n", main, getSym(elf, "main")->st_value);
 	
 	printf("Calculating Memory Segments\n");
 	elf = elfMakeMap(elf);
@@ -290,9 +398,10 @@ int main(int arc, char** argv) {
 	patchStatic(elf);
 	printf("Patching Dynamic Libraries\n");
 	patchDynLibs(elf);
-	printf("Executing Program\n");
-	execElf(elf, "main");
-	printf("Terminating Process\n");
+	printf("===== Executing Program =====\n");
+	execElf(elf, "hoisted_main");
+	//execElf(elf, "main");
+	printf("===== Terminating Process =====\n");
 	
 	return 0;
 }
